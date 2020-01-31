@@ -1,8 +1,10 @@
-#[derive(Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Cores(pub(self) usize);
 
-impl Default for Cores {
-    fn default() -> Self {
+impl Cores {
+    pub fn max() -> Self {
         Self(num_cpus::get())
     }
 }

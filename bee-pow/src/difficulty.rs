@@ -1,11 +1,21 @@
-#[derive(Clone)]
-pub struct Difficulty(pub usize);
+use common::constants::{HASH_TRIT_LEN, MAINNET_DIFFICULTY, DEVNET_DIFFICULTY, SPAMNET_DIFFICULTY};
 
-use common::constants::{HASH_TRIT_LEN, NETWORK_DIFFICULTY};
+use serde::{Deserialize, Serialize};
 
-impl Default for Difficulty {
-    fn default() -> Self {
-        Self(NETWORK_DIFFICULTY)
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Difficulty(pub(self) usize);
+
+impl Difficulty {
+    pub fn mainnet() -> Self {
+        Self(MAINNET_DIFFICULTY)
+    }
+
+    pub fn devnet() -> Self {
+        Self(DEVNET_DIFFICULTY)
+    }
+
+    pub fn spamnet() -> Self {
+        Self(SPAMNET_DIFFICULTY)
     }
 }
 
