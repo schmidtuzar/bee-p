@@ -1,11 +1,11 @@
-use super::Seed;
-use super::{
-    slice_eq, PrivateKey, PrivateKeyGenerator, PublicKey, RecoverableSignature, Signature,
+use crate::{
+    IotaSeed, PrivateKey, PrivateKeyGenerator, PublicKey, RecoverableSignature, Seed,
+    Signature,
 };
-use iota_crypto::Sponge;
+use crypto::Sponge;
 use std::marker::PhantomData;
+use ternary::{Trits, TritBuf};
 
-// TODO state as Vec<i8> ?
 // TODO constants
 
 #[derive(Default)]
@@ -21,17 +21,17 @@ pub struct WotsPrivateKeyGenerator<S> {
 }
 
 pub struct WotsPrivateKey<S> {
-    state: Vec<i8>,
+    state: TritBuf,
     _sponge: PhantomData<S>,
 }
 
 pub struct WotsPublicKey<S> {
-    state: Vec<i8>,
+    state: TritBuf,
     _sponge: PhantomData<S>,
 }
 
 pub struct WotsSignature<S> {
-    state: Vec<i8>,
+    state: TritBuf,
     _sponge: PhantomData<S>,
 }
 
@@ -40,6 +40,7 @@ pub struct WotsSignature<S> {
 pub enum WotsError {
     InvalidSecurityLevel(u8),
     MissingSecurityLevel,
+    FailedSpongeOperation,
 }
 
 impl<S: Sponge + Default> WotsPrivateKeyGeneratorBuilder<S> {
@@ -65,64 +66,71 @@ impl<S: Sponge + Default> WotsPrivateKeyGeneratorBuilder<S> {
 }
 
 impl<S: Sponge + Default> PrivateKeyGenerator for WotsPrivateKeyGenerator<S> {
+    type Seed = IotaSeed<S>;
     type PrivateKey = WotsPrivateKey<S>;
+    type Error = WotsError;
 
-    fn generate(&self, seed: &Seed, index: u64) -> Self::PrivateKey {
-        let subseed = seed.subseed::<S>(index);
+    fn generate(&self, seed: &Self::Seed, index: u64) -> Result<Self::PrivateKey, Self::Error> {
+        let subseed = seed.subseed(index);
         let mut sponge = S::default();
-        let mut state = vec![0; self.security_level as usize * 6561];
+        let mut state = TritBuf::with_capacity(self.security_level as usize * 6561);
 
-        sponge.absorb(&subseed.to_bytes()).unwrap();
-        sponge
-            .squeeze(&mut state[0..self.security_level as usize * 6561])
-            .unwrap();
-        sponge.reset();
+        if let Err(_) = sponge.digest_into(
+            &Trits::from_i8_unchecked(subseed.to_bytes()),
+            &mut state.as_trits_mut(),
+        ) {
+            return Err(Self::Error::FailedSpongeOperation);
+        }
 
-        Self::PrivateKey {
+        Ok(Self::PrivateKey {
             state: state,
             _sponge: PhantomData,
-        }
+        })
     }
 }
 
 impl<S: Sponge + Default> PrivateKey for WotsPrivateKey<S> {
     type PublicKey = WotsPublicKey<S>;
     type Signature = WotsSignature<S>;
+    type Error = WotsError;
 
-    fn generate_public_key(&self) -> Self::PublicKey {
+    fn generate_public_key(&self) -> Result<Self::PublicKey, Self::Error> {
         let mut sponge = S::default();
         let mut hashed_private_key = self.state.clone();
-        let mut digests = vec![0; (self.state.len() / 6561) * 243];
-        let mut hash = vec![0; 243];
+        let mut digests = TritBuf::with_capacity((self.state.len() / 6561) * 243);
+        let mut hash = TritBuf::with_capacity(243);
 
         for chunk in hashed_private_key.chunks_mut(243) {
             for _ in 0..26 {
-                sponge.absorb(chunk).unwrap();
-                sponge.squeeze(chunk).unwrap();
+                if let Err(_) = sponge.absorb(&Trits::from_i8_unchecked(chunk)) {
+                    return Err(Self::Error::FailedSpongeOperation);
+                }
+                sponge.squeeze_into(chunk);
                 sponge.reset();
             }
         }
 
-        for (i, chunk) in hashed_private_key.chunks(6561).enumerate() {
-            sponge.absorb(chunk).unwrap();
-            sponge
-                .squeeze(&mut digests[i * 243..(i + 1) * 243])
-                .unwrap();
-            sponge.reset();
+        for (i, chunk) in hashed_private_key.inner_ref().chunks(6561).enumerate() {
+            if let Err(_) = sponge.digest_into(
+                &Trits::from_i8_unchecked(chunk),
+                &mut digests[i * 243..(i + 1) * 243],
+            ) {
+                return Err(Self::Error::FailedSpongeOperation);
+            }
         }
 
-        sponge.absorb(&digests).unwrap();
-        sponge.squeeze(&mut hash).unwrap();
-        sponge.reset();
+        if let Err(_) = sponge.digest_into(&digests.as_trits(), &mut hash.as_trits_mut()) {
+            return Err(Self::Error::FailedSpongeOperation);
+        }
 
-        Self::PublicKey {
+        Ok(Self::PublicKey {
             state: hash,
             _sponge: PhantomData,
-        }
+        })
     }
 
     // TODO: enforce hash size ?
-    fn sign(&mut self, message: &[i8]) -> Self::Signature {
+    fn sign(&mut self, message: &[i8]) -> Result<Self::Signature, Self::Error> {
         let mut sponge = S::default();
         let mut signature = self.state.clone();
 
@@ -130,38 +138,39 @@ impl<S: Sponge + Default> PrivateKey for WotsPrivateKey<S> {
             let val = message[i * 3] + message[i * 3 + 1] * 3 + message[i * 3 + 2] * 9;
 
             for _ in 0..(13 - val) {
-                sponge.absorb(chunk).unwrap();
-                sponge.squeeze(chunk).unwrap();
+                if let Err(_) = sponge.absorb(chunk) {
+                    return Err(Self::Error::FailedSpongeOperation);
+                }
+                sponge.squeeze_into(chunk);
                 sponge.reset();
             }
         }
 
-        Self::Signature {
+        Ok(Self::Signature {
             state: signature,
             _sponge: PhantomData,
-        }
+        })
     }
 }
 
-/////////////////////////
-
 impl<S: Sponge + Default> PublicKey for WotsPublicKey<S> {
     type Signature = WotsSignature<S>;
+    type Error = WotsError;
 
     // TODO: enforce hash size ?
-    fn verify(&self, message: &[i8], signature: &Self::Signature) -> bool {
-        slice_eq(&signature.recover_public_key(message).state, &self.state)
+    fn verify(&self, message: &[i8], signature: &Self::Signature) -> Result<bool, Self::Error> {
+        Ok(&signature.recover_public_key(message)?.state == &self.state)
     }
 
     fn from_bytes(bytes: &[i8]) -> Self {
         Self {
-            state: bytes.to_vec(),
+            state: TritBuf::from_i8_unchecked(bytes),
             _sponge: PhantomData,
         }
     }
 
     fn to_bytes(&self) -> &[i8] {
-        &self.state
+        &self.state.inner_ref()
     }
 }
 
@@ -173,51 +182,56 @@ impl<S: Sponge + Default> Signature for WotsSignature<S> {
 
     fn from_bytes(bytes: &[i8]) -> Self {
         Self {
-            state: bytes.to_vec(),
+            state: TritBuf::from_i8_unchecked(bytes),
             _sponge: PhantomData,
         }
     }
 
     fn to_bytes(&self) -> &[i8] {
-        &self.state
+        &self.state.inner_ref()
     }
 }
 
 impl<S: Sponge + Default> RecoverableSignature for WotsSignature<S> {
     type PublicKey = WotsPublicKey<S>;
+    type Error = WotsError;
 
-    fn recover_public_key(&self, message: &[i8]) -> Self::PublicKey {
+    fn recover_public_key(&self, message: &[i8]) -> Result<Self::PublicKey, Self::Error> {
         let mut sponge = S::default();
-        let mut hash = [0; 243];
+        let mut hash = TritBuf::with_capacity(243);
+        // let mut digests = vec![0; (self.state.len() / 6561) * 243];
+        let mut digests = TritBuf::with_capacity((self.state.len() / 6561) * 243);
         let mut state = self.state.clone();
-        let mut digests = vec![0; (self.state.len() / 6561) * 243];
 
         for (i, chunk) in state.chunks_mut(243).enumerate() {
             let val = message[i * 3] + message[i * 3 + 1] * 3 + message[i * 3 + 2] * 9;
 
             for _ in 0..(val - -13) {
-                sponge.absorb(chunk).unwrap();
-                sponge.squeeze(chunk).unwrap();
+                if let Err(_) = sponge.absorb(&Trits::from_i8_unchecked(chunk)) {
+                    return Err(Self::Error::FailedSpongeOperation);
+                }
+                sponge.squeeze_into(chunk);
                 sponge.reset();
             }
         }
 
-        for (i, chunk) in state.chunks_mut(6561).enumerate() {
-            sponge.absorb(&chunk).unwrap();
-            sponge
-                .squeeze(&mut digests[i * 243..(i + 1) * 243])
-                .unwrap();
-            sponge.reset();
+        for (i, chunk) in state.chunks(6561).enumerate() {
+            if let Err(_) = sponge.digest_into(
+                &Trits::from_i8_unchecked(chunk),
+                &mut digests[i * 243..(i + 1) * 243],
+            ) {
+                return Err(Self::Error::FailedSpongeOperation);
+            }
         }
 
-        sponge.absorb(&digests).unwrap();
-        sponge.squeeze(&mut hash).unwrap();
-        sponge.reset();
+        if let Err(_) = sponge.digest_into(&digests.as_trits(), &mut hash.as_trits_mut()) {
+            return Err(Self::Error::FailedSpongeOperation);
+        }
 
-        Self::PublicKey {
-            state: hash.to_vec(),
+        Ok(Self::PublicKey {
+            state: hash,
             _sponge: PhantomData,
-        }
+        })
     }
 }
 
@@ -225,56 +239,56 @@ impl<S: Sponge + Default> RecoverableSignature for WotsSignature<S> {
 mod tests {
 
     use super::*;
+    use crypto::{CurlP27, CurlP81};
     use iota_conversion::Trinary;
-    use iota_crypto::{Curl, Kerl};
 
     const SEED: &str =
         "NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN";
     const MESSAGE: &str =
         "CHXHLHQLOPYP9NSUXTMWWABIBSBLUFXFRNWOZXJPVJPBCIDI99YBSCFYILCHPXHTSEYSYWIGQFERCRVDD";
 
-    #[test]
-    fn wots_generator_missing_security_level_test() {
-        match WotsPrivateKeyGeneratorBuilder::<Kerl>::default().build() {
-            Ok(_) => unreachable!(),
-            Err(err) => assert_eq!(err, WotsError::MissingSecurityLevel),
-        }
-    }
+    // #[test]
+    // fn wots_generator_missing_security_level_test() {
+    //     match WotsPrivateKeyGeneratorBuilder::<Kerl>::default().build() {
+    //         Ok(_) => unreachable!(),
+    //         Err(err) => assert_eq!(err, WotsError::MissingSecurityLevel),
+    //     }
+    // }
 
-    #[test]
-    fn wots_generator_invalid_security_level_test() {
-        match WotsPrivateKeyGeneratorBuilder::<Kerl>::default()
-            .security_level(0)
-            .build()
-        {
-            Err(WotsError::InvalidSecurityLevel(s)) => assert_eq!(s, 0),
-            _ => unreachable!(),
-        }
+    // #[test]
+    // fn wots_generator_invalid_security_level_test() {
+    //     match WotsPrivateKeyGeneratorBuilder::<Kerl>::default()
+    //         .security_level(0)
+    //         .build()
+    //     {
+    //         Err(WotsError::InvalidSecurityLevel(s)) => assert_eq!(s, 0),
+    //         _ => unreachable!(),
+    //     }
+    //
+    //     match WotsPrivateKeyGeneratorBuilder::<Kerl>::default()
+    //         .security_level(4)
+    //         .build()
+    //     {
+    //         Err(WotsError::InvalidSecurityLevel(s)) => assert_eq!(s, 4),
+    //         _ => unreachable!(),
+    //     }
+    // }
 
-        match WotsPrivateKeyGeneratorBuilder::<Kerl>::default()
-            .security_level(4)
-            .build()
-        {
-            Err(WotsError::InvalidSecurityLevel(s)) => assert_eq!(s, 4),
-            _ => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn wots_generator_valid_test() {
-        for s in 1..4 {
-            assert_eq!(
-                WotsPrivateKeyGeneratorBuilder::<Kerl>::default()
-                    .security_level(s)
-                    .build()
-                    .is_ok(),
-                true
-            );
-        }
-    }
+    // #[test]
+    // fn wots_generator_valid_test() {
+    //     for s in 1..4 {
+    //         assert_eq!(
+    //             WotsPrivateKeyGeneratorBuilder::<Kerl>::default()
+    //                 .security_level(s)
+    //                 .build()
+    //                 .is_ok(),
+    //             true
+    //         );
+    //     }
+    // }
 
     fn wots_generic_complete_test<S: Sponge + Default>() {
-        let seed = Seed::from_bytes(&SEED.trits()).unwrap();
+        let seed = IotaSeed::<S>::from_bytes(&SEED.trits()).unwrap();
 
         for security in 1..4 {
             for index in 0..5 {
@@ -282,28 +296,29 @@ mod tests {
                     .security_level(security)
                     .build()
                     .unwrap();
-                // TODO mut ?
-                let mut private_key = private_key_generator.generate(&seed, index);
-                let public_key = private_key.generate_public_key();
-                let bytes = public_key.to_bytes();
-                let signature = private_key.sign(&MESSAGE.trits());
-                let recovered_public_key = signature.recover_public_key(&MESSAGE.trits());
-                assert!(slice_eq(
-                    public_key.to_bytes(),
-                    recovered_public_key.to_bytes()
-                ));
-                let valid = public_key.verify(&MESSAGE.trits(), &signature);
+                let mut private_key = private_key_generator.generate(&seed, index).unwrap();
+                let public_key = private_key.generate_public_key().unwrap();
+                let signature = private_key.sign(&MESSAGE.trits()).unwrap();
+                let recovered_public_key = signature.recover_public_key(&MESSAGE.trits()).unwrap();
+                assert_eq!(public_key.to_bytes(), recovered_public_key.to_bytes());
+                let valid = public_key.verify(&MESSAGE.trits(), &signature).unwrap();
                 assert!(valid);
             }
         }
     }
 
+    // #[test]
+    // fn wots_kerl_complete_test() {
+    //     wots_generic_complete_test::<Kerl>();
+    // }
+
     #[test]
-    fn wots_kerl_complete_test() {
-        wots_generic_complete_test::<Kerl>();
+    fn wots_curl27_complete_test() {
+        wots_generic_complete_test::<CurlP27>();
     }
+
     #[test]
-    fn wots_curl_complete_test() {
-        wots_generic_complete_test::<Curl>();
+    fn wots_curl81_complete_test() {
+        wots_generic_complete_test::<CurlP81>();
     }
 }
